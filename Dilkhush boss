@@ -1,0 +1,409 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  GAME_PACKAGE: com.your.game   # <-- APNI GAME KA PACKAGE NAME YAHAN DAALO
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "clicker"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.0" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.clicker"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.clicker"
+                  minSdk = 30
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+              <application android:label="AI Clicker">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+
+                  <service android:name=".CaptureService" android:exported="false"
+                           android:foregroundServiceType="mediaProjection"/>
+
+                  <service android:name=".ClickerService" android:exported="true"
+                           android:label="AI Clicker"
+                           android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService"/>
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice"
+                                 android:resource="@xml/accessibility_service_config"/>
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="true"
+              android:accessibilityFlags="flagReportViewIds"
+              android:notificationTimeout="100"/>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/clicker
+          cat > app/src/main/java/com/example/clicker/Vision.kt <<'EOF_FILE'
+          package com.example.clicker
+
+          import android.graphics.Bitmap
+          import kotlin.math.abs
+
+          /** x, y are fractions of screen (0..1) */
+          data class Blob(val x: Float, val y: Float, val area: Int)
+          data class Scene(
+              val monkeyX: Float?,
+              val fruits: List<Blob>,
+              val bombs: List<Blob>,
+              val popup: Boolean,      // dark overlay popup (Claim / Game Over / Claimed)
+              val greenBtn: Boolean    // green button visible at popup position
+          )
+
+          object Vision {
+              private fun luma(c: Int) = (((c shr 16) and 255) * 3 + ((c shr 8) and 255) * 6 + (c and 255)) / 10
+
+              private fun isGreen(c: Int): Boolean {
+                  val r = (c shr 16) and 255; val g = (c shr 8) and 255; val b = c and 255
+                  return g > 140 && g > r + 50 && g > b + 20 && r < 120
+              }
+
+              fun analyze(bmp: Bitmap): Scene {
+                  val w = bmp.width; val h = bmp.height
+                  val px = IntArray(w * h)
+                  bmp.getPixels(px, 0, w, 0, 0, w, h)
+
+                  // 1) Popup = pura screen dark/blur
+                  var sum = 0; var n = 0
+                  for (fy in listOf(0.2f, 0.3f)) for (fx in listOf(0.2f, 0.5f, 0.8f)) {
+                      sum += luma(px[(fy * h).toInt() * w + (fx * w).toInt()]); n++
+                  }
+                  val popup = sum / n < 95
+                  val green = isGreen(px[(0.60f * h).toInt() * w + (0.69f * w).toInt()])
+                  if (popup) return Scene(null, emptyList(), emptyList(), true, green)
+
+                  // 2) Color masks: 1 = fruit (red/orange), 2 = bomb (dark gray)
+                  val mask = ByteArray(w * h)
+                  val y0 = (0.15f * h).toInt(); val y1 = (0.92f * h).toInt()
+                  for (y in y0 until y1) for (x in 0 until w) {
+                      val c = px[y * w + x]
+                      val r = (c shr 16) and 255; val g = (c shr 8) and 255; val b = c and 255
+                      mask[y * w + x] = when {
+                          r < 75 && g < 75 && b < 80 && abs(r - g) < 18 && abs(g - b) < 25 -> 2
+                          r > 190 && g < 100 && b < 90 -> 1                 // apple (red)
+                          r > 230 && g in 110..175 && b < 70 -> 1           // orange
+                          else -> 0
+                      }
+                  }
+
+                  // 3) Monkey = yellow hoodie, neeche wali band me
+                  var sx = 0L; var cnt = 0
+                  for (y in (0.65f * h).toInt() until (0.95f * h).toInt()) for (x in 0 until w) {
+                      val c = px[y * w + x]
+                      val r = (c shr 16) and 255; val g = (c shr 8) and 255; val b = c and 255
+                      if (r > 230 && g > 185 && b < 80) { sx += x; cnt++ }
+                  }
+                  val mx = if (cnt > 40) sx.toFloat() / cnt / w else null
+
+                  val fruits = blobs(mask, 1, w, h, 120).filter { it.y < 0.78f }
+                  val bombs = blobs(mask, 2, w, h, 120)
+                  return Scene(mx, fruits, bombs, false, green)
+              }
+
+              private fun blobs(mask: ByteArray, code: Byte, w: Int, h: Int, minArea: Int): List<Blob> {
+                  val seen = BooleanArray(w * h)
+                  val stack = IntArray(w * h)
+                  val out = ArrayList<Blob>()
+                  for (i in mask.indices) {
+                      if (mask[i] != code || seen[i]) continue
+                      var sp = 0; stack[sp++] = i; seen[i] = true
+                      var area = 0; var sx = 0L; var sy = 0L
+                      while (sp > 0) {
+                          val p = stack[--sp]; val qx = p % w; val qy = p / w
+                          area++; sx += qx; sy += qy
+                          if (qx > 0 && mask[p - 1] == code && !seen[p - 1]) { seen[p - 1] = true; stack[sp++] = p - 1 }
+                          if (qx < w - 1 && mask[p + 1] == code && !seen[p + 1]) { seen[p + 1] = true; stack[sp++] = p + 1 }
+                          if (qy > 0 && mask[p - w] == code && !seen[p - w]) { seen[p - w] = true; stack[sp++] = p - w }
+                          if (qy < h - 1 && mask[p + w] == code && !seen[p + w]) { seen[p + w] = true; stack[sp++] = p + w }
+                      }
+                      if (area >= minArea) out += Blob(sx.toFloat() / area / w, sy.toFloat() / area / h, area)
+                  }
+                  return out
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/clicker
+          cat > app/src/main/java/com/example/clicker/Capture.kt <<'EOF_FILE'
+          package com.example.clicker
+
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.*
+          import android.provider.Settings
+          import android.util.DisplayMetrics
+          import android.widget.Button
+          import android.widget.LinearLayout
+
+          /** Latest screen frame (1/4 size) + real screen size */
+          object Frames {
+              @Volatile var latest: Bitmap? = null
+              @Volatile var screenW = 1080
+              @Volatile var screenH = 2400
+          }
+
+          class CaptureService : Service() {
+              private var projection: MediaProjection? = null
+              private var reader: ImageReader? = null
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("cap", "Capture", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "cap").setContentTitle("Bot screen capture chal raha hai")
+                      .setSmallIcon(android.R.drawable.ic_menu_camera).build()
+                  startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+
+                  val data = i?.getParcelableExtra<Intent>("data") ?: return START_NOT_STICKY
+                  val mgr = getSystemService(MediaProjectionManager::class.java)
+                  val mp = mgr.getMediaProjection(i.getIntExtra("code", 0), data)
+                  mp.registerCallback(object : MediaProjection.Callback() {}, Handler(Looper.getMainLooper()))
+                  projection = mp
+
+                  val dm = DisplayMetrics()
+                  getSystemService(DisplayManager::class.java).getDisplay(0).getRealMetrics(dm)
+                  Frames.screenW = dm.widthPixels; Frames.screenH = dm.heightPixels
+                  val w = dm.widthPixels / 4; val h = dm.heightPixels / 4
+
+                  val ir = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                  reader = ir
+                  mp.createVirtualDisplay("cap", w, h, dm.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, ir.surface, null, null)
+
+                  val ht = HandlerThread("cap").apply { start() }
+                  ir.setOnImageAvailableListener({ r ->
+                      val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+                      try {
+                          val pl = img.planes[0]
+                          val rowPad = pl.rowStride - pl.pixelStride * w
+                          val bmp = Bitmap.createBitmap(w + rowPad / pl.pixelStride, h, Bitmap.Config.ARGB_8888)
+                          bmp.copyPixelsFromBuffer(pl.buffer)
+                          Frames.latest = if (rowPad == 0) bmp else Bitmap.createBitmap(bmp, 0, 0, w, h)
+                      } finally { img.close() }
+                  }, Handler(ht.looper))
+                  return START_NOT_STICKY
+              }
+
+              override fun onDestroy() { projection?.stop(); super.onDestroy() }
+          }
+
+          class MainActivity : Activity() {
+              private val REQ = 1
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val l = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
+                  fun btn(t: String, f: () -> Unit) = l.addView(Button(this).apply { text = t; setOnClickListener { f() } })
+                  btn("1. Accessibility ON karo") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  btn("2. Screen capture allow karo") {
+                      startActivityForResult(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent(), REQ)
+                  }
+                  btn("3. Bot START") { ClickerService.running = true }
+                  btn("Bot STOP") { ClickerService.running = false }
+                  setContentView(l)
+              }
+
+              @Deprecated("simple")
+              override fun onActivityResult(r: Int, c: Int, d: Intent?) {
+                  super.onActivityResult(r, c, d)
+                  if (r == REQ && c == RESULT_OK && d != null)
+                      startForegroundService(Intent(this, CaptureService::class.java).putExtra("code", c).putExtra("data", d))
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/clicker
+          cat > app/src/main/java/com/example/clicker/ClickerService.kt <<'EOF_FILE'
+          package com.example.clicker
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Path
+          import android.util.Log
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import kotlinx.coroutines.*
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.min
+
+          class ClickerService : AccessibilityService() {
+              companion object {
+                  const val TAG = "Clicker"
+                  const val GAME_PACKAGE = "com.your.game"      // <-- APNI GAME KA PACKAGE NAME DAALO
+                  val AD_HINTS = listOf("AdActivity", "ads", "applovin", "unity3d", "ironsource", "vungle", "inmobi", "mbridge", "pangle")
+                  val REWARD_TEXTS = listOf("Reward granted", "Reward earned")
+                  @Volatile var running = false
+              }
+
+              private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+              @Volatile private var adActive = false
+              private var adSince = 0L
+              private var lastTap = 0L
+              private var cornerTry = 0
+              @Volatile private var gesturing = false
+              private fun now() = System.currentTimeMillis()
+
+              override fun onServiceConnected() { scope.launch { loop() } }
+              override fun onInterrupt() {}
+              override fun onDestroy() { scope.cancel(); super.onDestroy() }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent) {
+                  if (e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+                  val cls = e.className?.toString() ?: return
+                  Log.d(TAG, "window: ${e.packageName} / $cls")   // logcat dekh ke AD_HINTS tune karo
+                  val isAd = AD_HINTS.any { cls.contains(it, true) }
+                  if (isAd && !adActive) { adActive = true; adSince = now(); cornerTry = 0 }
+                  else if (!isAd && adActive && e.packageName == GAME_PACKAGE && !cls.startsWith("android.")) adActive = false
+              }
+
+              private suspend fun loop() {
+                  while (scope.isActive) {
+                      delay(if (adActive) 500 else 70)
+                      if (!running) continue
+                      try { step() } catch (e: Exception) { Log.e(TAG, "step", e) }
+                  }
+              }
+
+              private fun step() {
+                  if (adActive && now() - adSince > 90_000) adActive = false   // safety
+                  if (adActive) { handleAd(); return }
+                  if (rootInActiveWindow?.packageName != GAME_PACKAGE) return
+                  val bmp = Frames.latest ?: return
+                  val s = Vision.analyze(bmp)
+                  if (s.popup) handlePopup(s) else playGame(s)
+              }
+
+              // ---------- POPUPS: Claim / Try Again / Continue ----------
+              private fun handlePopup(s: Scene) {
+                  if (now() - lastTap < 1500) return
+                  val root = rootInActiveWindow
+                  // exact text match: "Claimed" ko "Claim" na samjhe. Cancel/Quit/No Thanks kabhi nahi.
+                  var done = root != null && listOf("Claim", "Try Again", "Continue").any { clickByText(root, it) }
+                  if (!done && s.greenBtn) { tapFrac(0.69f, 0.60f); done = true }
+                  if (done) lastTap = now()
+              }
+
+              // ---------- AD: reward ke baad sirf X ----------
+              private fun handleAd() {
+                  val root = rootInActiveWindow
+                  val rewardDone = root != null && REWARD_TEXTS.any { root.findAccessibilityNodeInfosByText(it).isNotEmpty() }
+                  if (!rewardDone && now() - adSince < 45_000) return     // countdown chal raha hai
+                  if (now() - lastTap < 2000) return
+                  lastTap = now()
+                  if (root != null && clickCloseNode(root)) return
+                  when (cornerTry++ % 3) {                                // fallback: sirf upar ke corners ya Back
+                      0 -> tapFrac(0.94f, 0.07f)
+                      1 -> tapFrac(0.06f, 0.07f)
+                      else -> performGlobalAction(GLOBAL_ACTION_BACK)
+                  }
+              }
+
+              // ---------- GAME ----------
+              private fun playGame(s: Scene) {
+                  if (gesturing) return
+                  val mx = s.monkeyX ?: return
+                  val tx = decide(s, mx) ?: return
+                  if (abs(tx - mx) < 0.03f) return
+                  swipe(mx, tx)
+              }
+
+              private fun decide(s: Scene, mx: Float): Float? {
+                  val safeW = 0.13f
+                  fun threatened(x: Float) = s.bombs.any { abs(it.x - x) < safeW && it.y > 0.25f }
+                  fun blocked(a: Float, b: Float): Boolean {
+                      val lo = min(a, b) - safeW * 0.8f; val hi = max(a, b) + safeW * 0.8f
+                      return s.bombs.any { it.x in lo..hi && it.y > 0.55f }
+                  }
+                  // sabse neeche (monkey ke paas) wala safe fruit
+                  for (f in s.fruits.sortedByDescending { it.y })
+                      if (!threatened(f.x) && !blocked(mx, f.x)) return f.x
+                  // koi safe fruit nahi: bomb se door raho
+                  if (!threatened(mx)) return mx
+                  var c = 0.1f
+                  val cands = ArrayList<Float>()
+    
