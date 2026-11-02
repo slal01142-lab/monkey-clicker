@@ -406,4 +406,6 @@ jobs:
                   if (!threatened(mx)) return mx
                   var c = 0.1f
                   val cands = ArrayList<Float>()
+
+                          path: app/build/outputs/apk/debug/app-debug.apk
     
