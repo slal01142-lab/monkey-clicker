@@ -1,23 +1,28 @@
 name: Build APK
-on: [push, workflow_dispatch]
+on: workflow_dispatch
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Zip kholo
-        run: unzip -q MonkeyHopClicker.zip
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
-      - uses: gradle/actions/setup-gradle@v3
+      - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.5
-      - name: Build
-        working-directory: MonkeyHopClicker
-        run: gradle assembleDebug --no-daemon
+          gradle-version: 8.7
+      - run: |
+          unzip -o MonkeyHopClicker.zip -d src
+          ROOT="$(dirname "$(find src -name 'settings.gradle*' | head -1)")"
+          cd "$ROOT"
+          if [ -f app/build.gradle.kts ]; then
+            sed -i '0,/defaultConfig {/s//defaultConfig {\n        ndk { abiFilters += listOf("arm64-v8a") }/' app/build.gradle.kts
+          else
+            sed -i '0,/defaultConfig {/s//defaultConfig {\n        ndk { abiFilters "arm64-v8a" }/' app/build.gradle
+          fi
+          gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: MonkeyHopClicker-apk
-          path: MonkeyHopClicker/app/build/outputs/apk/debug/app-debug.apk
+          path: src/**/build/outputs/apk/debug/*.apk
