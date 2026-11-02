@@ -19,9 +19,9 @@ jobs:
           ROOT="$(dirname "$(find src -name 'settings.gradle*' | head -1)")"
           cd "$ROOT"
           if [ -f app/build.gradle.kts ]; then
-            sed -i '0,/defaultConfig {/s//defaultConfig {\n        ndk { abiFilters += listOf("arm64-v8a") }/' app/build.gradle.kts
+            sed -i '0,/defaultConfig {/s//defaultConfig {\n        applicationIdSuffix = ".v2"\n        ndk { abiFilters += listOf("arm64-v8a") }/' app/build.gradle.kts
           else
-            sed -i '0,/defaultConfig {/s//defaultConfig {\n        ndk { abiFilters "arm64-v8a" }/' app/build.gradle
+            sed -i '0,/defaultConfig {/s//defaultConfig {\n        applicationIdSuffix ".v2"\n        ndk { abiFilters "arm64-v8a" }/' app/build.gradle
           fi
           gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
