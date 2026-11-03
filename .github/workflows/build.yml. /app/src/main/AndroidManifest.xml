@@ -1,0 +1,558 @@
+
+
+===== FILE: .github/workflows/build.yml =====
+name: Build APK
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MonkeyHopClicker-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+
+===== FILE: README.txt =====
+Monkey Hop Clicker - setup
+1) Ye poora folder GitHub repo (monkey-clicker) me upload karo (zip extract karke ya "Add file > Upload files").
+2) Actions tab > "Build APK" > Run workflow. Khatam hone par Artifacts se MonkeyHopClicker-apk download karo.
+3) Install karo. App kholo > 1) App info > 3 dots > Allow restricted settings.
+4) 2) Accessibility settings > Downloaded apps > Monkey Hop Clicker > ON.
+5) Game kholo, right side ke START button dabao. Rokne ke liye STOP.
+Tuning: app/src/main/java/com/monkey/clicker/Cfg.kt
+
+
+===== FILE: app/build.gradle.kts =====
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.monkey.clicker"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.monkey.clicker"
+        minSdk = 30
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+}
+
+dependencies {
+    implementation("com.google.mlkit:text-recognition:16.0.0")
+    implementation("com.google.android.gms:play-services-tasks:18.2.0")
+}
+
+
+===== FILE: app/src/main/AndroidManifest.xml =====
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application
+        android:allowBackup="false"
+        android:label="Monkey Hop Clicker"
+        android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".ClickerService"
+            android:exported="false"
+            android:label="Monkey Hop Clicker"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_config" />
+        </service>
+    </application>
+</manifest>
+
+
+===== FILE: app/src/main/java/com/monkey/clicker/Cfg.kt =====
+package com.monkey.clicker
+
+/** Saari tunable values yahan hain. Game me kuch galat chale to pehle yahi badlo. */
+object Cfg {
+    // Gameplay: screen ko kitni der hold karna hai aur do holds ke beech gap (ms)
+    const val HOLD_MS = 500L
+    const val HOLD_GAP_MS = 700L
+
+    // Fruit game: bomb se kitni door rehna hai (screen width ka fraction)
+    const val SAFE_X = 0.18f
+    // Fruit/bomb dhundne ka area (screen height ka fraction): upar HUD aur neeche monkey chhod ke
+    const val PLAY_TOP = 0.14f
+    const val PLAY_BOTTOM = 0.80f
+    // Monkey ki height jahan swipe karna hai
+    const val MONKEY_Y = 0.86f
+
+    // THEME screen ka back arrow (top-left)
+    const val BACK_ARROW_X = 0.07f
+    const val BACK_ARROW_Y = 0.06f
+
+    // THEME tile text na mile to yahan tap hoga (bottom-left)
+    const val THEME_FALLBACK_X = 0.12f
+    const val THEME_FALLBACK_Y = 0.90f
+}
+
+
+===== FILE: app/src/main/java/com/monkey/clicker/ClickerService.kt =====
+package com.monkey.clicker
+
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.Path
+import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.view.Display
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.Toast
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.math.abs
+
+class ClickerService : AccessibilityService() {
+
+    private class Line(val t: String, val box: Rect) {
+        val cx get() = box.centerX().toFloat()
+        val cy get() = box.centerY().toFloat()
+    }
+
+    private val tag = "MonkeyClicker"
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile private var running = false
+    private var worker: Thread? = null
+    private var wm: WindowManager? = null
+    private var overlay: View? = null
+    private var startBtn: Button? = null
+    private var stopBtn: Button? = null
+    private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
+
+    // bot state
+    private var fruitMode = false
+    private var fruitX = 0f
+    private var lastOcr = 0L
+    private var adKind = 0            // 0 = koi nahi, 1 = THEME wala ad, 2 = Claim wala ad
+    private var adStart = 0L
+    private var adAttempt = 0
+    private var lastFallback = 0L
+    private var lastHold = 0L
+
+    // ---------------------------------------------------------------- lifecycle
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        showOverlay()
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onInterrupt() { stopBot() }
+
+    override fun onDestroy() {
+        stopBot()
+        removeOverlay()
+        super.onDestroy()
+    }
+
+    // ---------------------------------------------------------------- overlay (START / STOP)
+    private fun showOverlay() {
+        if (overlay != null) return
+        try {
+            val mgr = getSystemService(WINDOW_SERVICE) as WindowManager
+            wm = mgr
+            val d = resources.displayMetrics.density
+            val col = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding((3 * d).toInt(), (3 * d).toInt(), (3 * d).toInt(), (3 * d).toInt())
+                setBackgroundColor(Color.argb(110, 0, 0, 0))
+            }
+            fun mk(label: String, color: Int, onClick: () -> Unit) = Button(this).apply {
+                text = label
+                textSize = 11f
+                minHeight = 0; minimumHeight = 0; minWidth = 0; minimumWidth = 0
+                setPadding(0, 0, 0, 0)
+                setTextColor(Color.WHITE)
+                setBackgroundColor(color)
+                setOnClickListener { onClick() }
+            }
+            startBtn = mk("START", Color.rgb(0, 150, 0)) { startBot() }
+            stopBtn = mk("STOP", Color.rgb(190, 0, 0)) { stopBot() }
+            col.addView(startBtn, LinearLayout.LayoutParams((70 * d).toInt(), (38 * d).toInt()))
+            col.addView(stopBtn, LinearLayout.LayoutParams((70 * d).toInt(), (38 * d).toInt()).apply {
+                topMargin = (4 * d).toInt()
+            })
+            val lp = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT
+            )
+            lp.gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            mgr.addView(col, lp)
+            overlay = col
+            updateButtons()
+        } catch (t: Throwable) {
+            Log.e(tag, "overlay fail", t)
+        }
+    }
+
+    private fun removeOverlay() {
+        try { overlay?.let { wm?.removeView(it) } } catch (_: Throwable) {}
+        overlay = null
+    }
+
+    private fun updateButtons() {
+        mainHandler.post {
+            startBtn?.alpha = if (running) 0.4f else 1f
+            stopBtn?.alpha = if (running) 1f else 0.4f
+        }
+    }
+
+    private fun toast(msg: String) {
+        mainHandler.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+    }
+
+    // ---------------------------------------------------------------- start / stop
+    private fun startBot() {
+        if (running) return
+        running = true
+        fruitMode = false; adKind = 0; lastHold = 0L; lastOcr = 0L
+        toast("Started")
+        updateButtons()
+        worker = Thread {
+            try {
+                while (running) {
+                    try {
+                        step()
+                    } catch (e: InterruptedException) {
+                        break
+                    } catch (t: Throwable) {
+                        Log.e(tag, "step error", t)
+                        sleepMs(600)
+                    }
+                }
+            } finally {
+                running = false
+                updateButtons()
+            }
+        }.also { it.start() }
+    }
+
+    private fun stopBot() {
+        if (running) toast("Stopped")
+        running = false
+        worker?.interrupt()
+        updateButtons()
+    }
+
+    // ---------------------------------------------------------------- main step
+    private fun step() {
+        val shot = screenshot()
+        if (shot == null) { sleepMs(700); return }
+        try {
+            val w = shot.width
+            val h = shot.height
+            if (fruitMode) {
+                val needOcr = System.currentTimeMillis() - lastOcr > 1200
+                if (!needOcr) { handleFruit(shot, w, h); sleepMs(150); return }
+                val lines = ocr(shot)
+                lastOcr = System.currentTimeMillis()
+                if (isFruitScreen(lines, h)) { handleFruit(shot, w, h); sleepMs(150); return }
+                fruitMode = false
+                handleScreens(lines, w, h)
+                return
+            }
+            val lines = ocr(shot)
+            lastOcr = System.currentTimeMillis()
+            handleScreens(lines, w, h)
+        } finally {
+            shot.recycle()
+        }
+    }
+
+    private fun handleScreens(lines: List<Line>, w: Int, h: Int) {
+        val now = System.currentTimeMillis()
+        val all = lines.joinToString(" | ") { it.t }
+
+        // Ad chal raha hai: sirf countdown khatam hone ka wait + cross
+        if (adKind != 0) {
+            val done = if (adKind == 1) all.contains("get more") else all.contains("claimed")
+            if (!done && now - adStart < 80_000) {
+                handleAd(lines, w, h, now)
+                sleepMs(500)
+                return
+            }
+            adKind = 0
+        }
+
+        // Fruit catching screen
+        if (isFruitScreen(lines, h)) {
+            fruitMode = true
+            fruitX = w / 2f
+            return
+        }
+
+        // Fruit game over -> hamesha Try Again (Quit kabhi nahi)
+        find(lines, "try again")?.let { tapLine(it); sleepMs(1200); return }
+
+        // "Claimed" screen -> Continue (No Thanks nahi)
+        if (all.contains("claimed")) {
+            find(lines, "continue")?.let { tapLine(it); sleepMs(1200) }
+            return
+        }
+
+        // Gem reward screen -> Claim (Cancel nahi), phir ad
+        word(lines, "claim")?.let {
+            tapLine(it)
+            startAd(2, now)
+            sleepMs(1200)
+            return
+        }
+
+        // "Do you want to continue?" -> NO THANKS (Watch Ad nahi)
+        if (all.contains("do you want") || (all.contains("no thanks") && all.contains("watch"))) {
+            find(lines, "no thanks")?.let { tapLine(it); sleepMs(1200) }
+            return
+        }
+
+        // Game Over -> RESTART (Skip Level nahi)
+        find(lines, "restart")?.let { tapLine(it); sleepMs(1200); return }
+
+        // Level Completed -> THEME tile (NEXT nahi), phir ad
+        if (all.contains("completed")) {
+            val theme = find(lines, "theme")
+            if (theme != null) tapLine(theme) else tap(w * Cfg.THEME_FALLBACK_X, h * Cfg.THEME_FALLBACK_Y)
+            startAd(1, now)
+            sleepMs(1200)
+            return
+        }
+
+        // Theme selection screen -> back arrow (top-left)
+        if (all.contains("get more")) {
+            tap(w * Cfg.BACK_ARROW_X, h * Cfg.BACK_ARROW_Y)
+            sleepMs(1200)
+            return
+        }
+
+        // Main menu -> Play
+        lines.firstOrNull { it.t == "play" }?.let { tapLine(it); sleepMs(1200); return }
+
+        // "Hold TO Jump" screen -> tap karke game start
+        if (all.contains("hold") && all.contains("jump")) {
+            tap(w / 2f, h / 2f)
+            lastHold = 0L
+            sleepMs(900)
+            return
+        }
+
+        // Gameplay: screen hold karo (monkey agle box par kudta hai)
+        if (now - lastHold >= Cfg.HOLD_GAP_MS) {
+            gesture(w * 0.5f, h * 0.6f, w * 0.5f, h * 0.6f, Cfg.HOLD_MS)
+            lastHold = System.currentTimeMillis()
+        } else {
+            sleepMs(150)
+        }
+    }
+
+    private fun startAd(kind: Int, now: Long) {
+        adKind = kind
+        adStart = now
+        adAttempt = 0
+        lastFallback = now
+    }
+
+    // ---------------------------------------------------------------- ad handling
+    private fun handleAd(lines: List<Line>, w: Int, h: Int, now: Long) {
+        // Countdown abhi chal raha hai? (chhota number ya "reward in")
+        val counting = lines.any {
+            Regex("^\\d{1,2}$").matches(it.t) || it.t.contains("reward in")
+        }
+        if (counting) return
+
+        // Cross / close button
+        val crossChars = setOf("x", "\u00d7", "\u2715", "\u2716", "\u2717", "\u274c", "\u2a2f", "\u0445")
+        val cross = lines.firstOrNull {
+            val s = it.t.replace(" ", "")
+            (s in crossChars && it.box.width() < w * 0.15f) || s == "close" || s == "skipad" || s == "skip"
+        }
+        if (cross != null) {
+            tapLine(cross)
+            sleepMs(1000)
+            return
+        }
+
+        // Cross OCR se nahi mila: kuch der baad fallback (Back, top-right, top-left)
+        if (now - adStart > 8_000 && now - lastFallback > 3_000) {
+            lastFallback = now
+            when (adAttempt++ % 3) {
+                0 -> performGlobalAction(GLOBAL_ACTION_BACK)
+                1 -> tap(w * 0.94f, h * 0.06f)
+                else -> tap(w * 0.06f, h * 0.06f)
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- fruit game
+    private fun isFruitScreen(lines: List<Line>, h: Int): Boolean {
+        val all = lines.joinToString(" | ") { it.t }
+        if (all.contains("try again") || all.contains("game over") || all.contains("claim")) return false
+        val re = Regex("\\b\\d{1,3}\\s*/\\s*\\d{2,3}\\b")
+        return lines.any { re.containsMatchIn(it.t) && it.box.top < h * 0.25f }
+    }
+
+    private fun handleFruit(bmp: Bitmap, w: Int, h: Int) {
+        val target = FruitVision.decide(bmp, fruitX)
+        val dist = abs(target - fruitX)
+        if (dist < w * 0.03f) return
+        val y = h * Cfg.MONKEY_Y
+        val dur = (dist * 0.25f).toLong().coerceIn(80L, 400L)
+        gesture(fruitX, y, target, y, dur)
+        fruitX = target
+    }
+
+    // ---------------------------------------------------------------- helpers: find / tap
+    private fun find(lines: List<Line>, vararg keys: String): Line? =
+        lines.firstOrNull { l -> keys.any { l.t.contains(it) } }
+
+    private fun word(lines: List<Line>, wd: String): Line? {
+        val re = Regex("\\b$wd\\b")
+        return lines.firstOrNull { re.containsMatchIn(it.t) }
+    }
+
+    private fun tapLine(l: Line) = tap(l.cx, l.cy)
+
+    private fun tap(x: Float, y: Float) = gesture(x, y, x, y, 70)
+
+    private fun gesture(x1: Float, y1: Float, x2: Float, y2: Float, dur: Long) {
+        val p = Path()
+        p.moveTo(x1.coerceAtLeast(0f), y1.coerceAtLeast(0f))
+        if (x1 != x2 || y1 != y2) p.lineTo(x2.coerceAtLeast(0f), y2.coerceAtLeast(0f))
+        val g = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(p, 0, dur.coerceAtLeast(1L)))
+            .build()
+        val latch = CountDownLatch(1)
+        val ok = dispatchGesture(g, object : AccessibilityService.GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) { latch.countDown() }
+            override fun onCancelled(gestureDescription: GestureDescription?) { latch.countDown() }
+        }, null)
+        if (ok) latch.await(dur + 2000, TimeUnit.MILLISECONDS)
+    }
+
+    private fun sleepMs(ms: Long) { Thread.sleep(ms) }
+
+    // ---------------------------------------------------------------- helpers: screenshot / OCR
+    private fun screenshot(): Bitmap? {
+        var result: Bitmap? = null
+        val latch = CountDownLatch(1)
+        takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : AccessibilityService.TakeScreenshotCallback {
+            override fun onSuccess(r: AccessibilityService.ScreenshotResult) {
+                try {
+                    val hb = r.hardwareBuffer
+                    val hw = Bitmap.wrapHardwareBuffer(hb, r.colorSpace)
+                    result = hw?.copy(Bitmap.Config.ARGB_8888, false)
+                    hw?.recycle()
+                    hb.close()
+                } catch (t: Throwable) {
+                    Log.e(tag, "screenshot decode", t)
+                }
+                latch.countDown()
+            }
+
+            override fun onFailure(errorCode: Int) { latch.countDown() }
+        })
+        latch.await(3, TimeUnit.SECONDS)
+        return result
+    }
+
+    private fun ocr(bmp: Bitmap): List<Line> {
+        val sc = 0.5f
+        val small = Bitmap.createScaledBitmap(bmp, (bmp.width * sc).toInt(), (bmp.height * sc).toInt(), true)
+        val out = ArrayList<Line>()
+        try {
+            val res = Tasks.await(recognizer.process(InputImage.fromBitmap(small, 0)), 8, TimeUnit.SECONDS)
+            for (b in res.textBlocks) for (l in b.lines) {
+                val r = l.boundingBox ?: continue
+                out.add(
+                    Line(
+                        l.text.lowercase().trim(),
+                        Rect((r.left / sc).toInt(), (r.top / sc).toInt(), (r.right / sc).toInt(), (r.bottom / sc).toInt())
+                    )
+                )
+            }
+        } finally {
+            small.recycle()
+        }
+        return out
+    }
+}
+
+
+===== FILE: app/src/main/java/com/monkey/clicker/FruitVision.kt =====
+package com.monkey.clicker
+
+import android.graphics.Bitmap
+import android.graphics.Color
+import kotlin.math.abs
+
+/**
+ * Fruit-catching screen ke liye simple colour-based detection.
+ * Bomb = chhota gol kaala blob. Fruit = background se alag saturated blob.
+ * Return: monkey ko kis x (pixels) par le jana hai (curX return ho to jagah par raho).
+ */
+object FruitVision {
+    private class Blob(val x: Float, val y: Float)
+
+    fun decide(bmp: Bitmap, curX: Float): Float {
+        val sw = 180
+        val sh = (bmp.height * sw.toFloat() / bmp.width).toInt()
+        val scale = bmp.width.toFloat() / sw
+        val small = Bitmap.createScaledBitmap(bmp, sw, sh, true)
+        val px = IntArray(sw * sh)
+        small.getPixels(px, 0, sw, 0, 0, sw, sh)
+        small.recycle()
+
+        val y0 = (sh * Cfg.PLAY_TOP).toInt()
+        val y1
